@@ -1,0 +1,11 @@
+numpy>=1.24
+torch>=2.1
+transformers>=4.40
+datasets>=2.18
+tqdm
+matplotlib>=3.7
+psutil
+scikit-learn>=1.3      # for KMeans / MiniBatchKMeans in src/codebooks/generate.py
+# Optional — only required if you use the vLLM backend (--backend vllm).
+# Comment out if your environment doesn't have vLLM installed.
+vllm>=0.6
