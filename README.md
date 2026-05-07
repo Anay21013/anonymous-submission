@@ -1,9 +1,126 @@
-# Spherical KV — Supplementary Code
+# Spherical KV
 
-Code for reproducing the experiments in the paper:
-**"Spherical KV: Angle-Domain Attention with Rate-Distortion KV Cache Compression"**
+<p align="center">
+  <img src="docs/angle_domain_attention.gif" width="720" alt="Angle-Domain Attention on the unit sphere: keys (gray/purple), query (blue), and predicted token (green) with angular arcs and radial vectors">
+  <br>
+  <em>Angle-Domain Attention: the decode kernel computes logits directly from spherical codes on the unit sphere, without reconstructing dense key vectors.</em>
+</p>
 
-## Setup
+<p align="center">
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python 3.11+"></a>
+  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.5+-ee4c2c.svg" alt="PyTorch 2.5+"></a>
+  <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-12.1+-76b900.svg" alt="CUDA 12.1+"></a>
+</p>
+
+**Code repository for the paper:** Spherical KV: Angle-Domain Attention and Rate-Distortion Retention for Memory-Bounded LLM Inference.
+
+> *Spherical KV decouples direction from magnitude in the KV cache: Angle-Domain Attention makes direction cheap in the decode hot loop, while Rate-Distortion Retention allocates bits and residency to states likely to matter later.*
+
+---
+
+## Table of Contents
+
+- [Abstract](#abstract)
+- [Methodology](#methodology)
+- [Results](#results)
+- [Installation](#installation)
+- [Reproducing Experiments](#reproducing-experiments)
+- [Configuration](#configuration)
+- [License](#license)
+
+---
+
+## Abstract
+
+Long-context decoding is increasingly limited not by FLOPs but by **KV cache growth**, **High Bandwidth Memory (HBM) bandwidth**, and **peak memory**. As sequence length $T$ scales, KV becomes the dominant resident state, shrinking feasible batch/context and forcing repeated HBM streaming per token that throttles throughput. Current mitigations (windowing/sinks, heuristic eviction, KV quantization/offload) often move the bottleneck rather than remove it: they discard history uniformly, rely on brittle salience proxies, or compress KV yet pay an implicit **reconstruction tax** (unpack/dequantize/rebuild dense vectors) that breaks fusion and restores bandwidth pressure.
+
+We frame KV memory as a **rate-distortion allocation** problem grounded in geometry: attention is primarily **directional** (query-key alignment) with magnitude as a scalar modulator. This yields two principles: **(i)** make direction cheap in the critical path, and **(ii)** allocate bits and residency only to states likely to matter later. We introduce **Spherical KV**, an inference primitive coupling **Angle-Domain Attention** with **Rate-Distortion KV Retention**.
+
+At matched quality (single tolerance $\Delta = 0.8$), Spherical KV consistently shifts the **memory-quality-throughput frontier**: across 8K/32K/128K, we observe **1.55x to 1.72x higher tok/s** while simultaneously reducing **resident KV bytes/token by 24 to 42%**. The gains strengthen in the **128K stress regime**, where paging/fragmentation are most punitive, yet the quality gap remains bounded by design.
+
+---
+
+## Methodology
+
+Spherical KV is built from **two orthogonal ideas** plus a **serving contract**.
+
+### 1. Angle-Domain Attention (no reconstruction)
+
+<p align="center">
+  <img src="docs/angle_domain_attention.gif" width="680" alt="Interactive sphere showing angle-domain attention geometry">
+  <br>
+  <em>Keys are directions on the unit sphere. The decode kernel computes cos θ from angular codes, then scales by radius r. No dense k ∈ ℝᵈ is ever materialized.</em>
+</p>
+
+Standard attention computes $\ell(\mathbf{q}, \mathbf{k}) = \mathbf{q}^\top \mathbf{k} / \sqrt{d}$. Writing $\mathbf{q} = \|\mathbf{q}\|\hat{\mathbf{q}}$ and $\mathbf{k} = \|\mathbf{k}\|\hat{\mathbf{k}}$ where $\hat{\mathbf{q}}, \hat{\mathbf{k}} \in \mathbb{S}^{d-1}$, the logit decomposes exactly:
+
+$$\ell(\mathbf{q}, \mathbf{k}) = \frac{\|\mathbf{q}\| \, \|\mathbf{k}\|}{\sqrt{d}} \cos\theta, \quad \cos\theta \doteq \hat{\mathbf{q}}^\top \hat{\mathbf{k}}.$$
+
+During **prefill**, keys are encoded into compact spherical tuples: a scalar radius $r_k \approx \|\mathbf{k}\|$, packed angle codes $c_k^\theta$ at tier $b$, plus lightweight tier/flags metadata. During **decode**, the kernel reads packed codes and computes $\widehat{\cos\theta}$ directly via an angular recurrence:
+
+$$\widehat{\cos\theta} \doteq f(c_q^\theta, c_k^\theta;\, b),$$
+
+where $f$ operates on **packed code streams** (SoA layout), is **single pass**, **block local**, and **fusion friendly** for GPU kernels. The critical path difference: instead of reconstructing a dense $\hat{\mathbf{k}} \in \mathbb{R}^d$, the kernel consumes packed K-codes directly and computes similarity via $\cos\theta$ *from codes*, ensuring reductions in KV bytes translate directly to reduced HBM bandwidth.
+
+### 2. Rate-Distortion Retention (keep/drop + precision)
+
+<p align="center">
+  <img src="docs/tier_allocation.gif" width="680" alt="Tier allocation dashboard showing budget sweep across prefill and decode">
+  <br>
+  <em>The RDR controller allocates tokens to tiers under a strict bit budget. As the budget tightens, the controller first reduces precision on low impact states before dropping them entirely.</em>
+</p>
+
+Under a strict memory budget, selecting a subset of tokens to keep is insufficient: one must also choose the **precision tier** of the retained states. We index cache states by $i$ (token x head; optionally layer) and choose:
+
+$$z_i \in \{0, 1\} \text{ (drop/keep)}, \quad b_i \in \mathcal{B} \text{ (tier)}.$$
+
+The controller solves:
+
+$$\min_{\{z_i, b_i\}} \mathbb{E}[\mathcal{L}(\text{Decode}_{\text{SphKV}}(\{z_i, b_i\}))] \quad \text{s.t.} \quad \sum_i z_i \cdot \text{cost}(b_i) \leq B,$$
+
+which is a rate-distortion allocation problem in the classical sense (Shannon, 1948). The greedy knapsack allocator (Algorithm 1) sweeps tokens by calibrated rate-distortion value, assigning them to tiered quantization levels:
+
+| Tier | Name | Bits | Group size (g) | Centroids (K) |
+|------|------|------|----------------|----------------|
+| 1 | High | 56 | 16 | 64 |
+| 2 | Mid | 48 | 16 | 16 |
+| 3 | Low | 22 | 32 | 8 |
+| — | Dropped | 0 | — | — |
+
+The output is **paged, tier homogeneous KV pages** compatible with streaming decode kernels: minimal headers, coalesced reads, and block local access patterns.
+
+---
+
+## Results
+
+All results measured under iso-quality constraint $\Delta = 0.8$ on paged/ragged KV serving with A100-80GB GPUs.
+
+### Decode Throughput (tok/s)
+
+| Model | 8K | | 32K | | 128K | |
+|-------|------|------|------|------|-------|------|
+| | Dense | SphKV | Dense | SphKV | Dense | SphKV |
+| Llama-3.1-8B | 173.4 | **268.5** | 110.0 | **183.0** | 62.9 | **108.0** |
+| Qwen2.5-14B | 151.6 | **239.4** | 93.3 | **153.9** | 55.7 | **94.8** |
+| GPT-oss-20B | 163.7 | **261.2** | 104.9 | **172.5** | 59.9 | **102.4** |
+
+Throughput gains are **stable to improving** with context length (1.55x at 8K, 1.72x at 128K), confirming that HBM bandwidth reduction from angle-domain attention compounds at long context.
+
+### Summary at Δ = 0.8
+
+| Metric | Range (across models and context lengths) |
+|--------|-------------------------------------------|
+| Quality gap δQ | 0.34 to 0.78 (within Δ = 0.8 tolerance) |
+| Throughput gain | 1.55x to 1.72x |
+| KV bytes/token reduction | 23.9% to 42.1% |
+
+### Effective KV Bytes/Token Accounting
+
+All reported $b_{\text{KV}}$ values are **all in**: payload bytes, masks/headers, page table entries, indirection pointers, and tier/control metadata. If Spherical KV wins in the throughput tables above, the win survives the most common realism critique.
+
+---
+
+## Installation
 
 ```bash
 conda create -n sphkv python=3.11 -y
@@ -13,195 +130,59 @@ pip install -r requirements.txt
 huggingface-cli login
 ```
 
-### requirements.txt
+**Hardware:** Codebook training needs 4 GB VRAM (1B models) or 24 GB (8B+). Evaluation at 8K to 32K context requires 24 GB VRAM; 128K+ requires A100-80GB. CUDA kernel compilation needs CUDA 12.1+ with nvcc.
 
-```
-transformers>=4.45.0
-datasets
-scikit-learn
-numpy
-tqdm
-matplotlib
-seaborn
-```
+---
 
-### Hardware
+## Reproducing Experiments
 
-| Task | Minimum GPU | Recommended |
-|------|-------------|-------------|
-| Codebook training (1B) | 4 GB VRAM | RTX 3050+ |
-| Codebook training (8B+) | 24 GB VRAM | A6000 / A100 |
-| W1 experiments (8K ctx) | 24 GB VRAM | A100-80GB |
-| W1 experiments (32K+ ctx) | 48 GB VRAM | A100-80GB |
-| W2/W3 experiments | 24 GB VRAM | A100-80GB |
-| CUDA kernel compilation | CUDA 12.1+ with nvcc | — |
+All experiments are driven by `scripts/experiment_runner.py`. Results are saved to `experiment_results/`.
 
-## Reproducing Results
-
-All experiments are run through `experiment_runner.py`. Results are saved to `experiment_results/`.
-
-### Step 0: Train codebooks (one-time per model)
+### Step 0: Train codebooks (one time per model)
 
 ```bash
-cd src/codebooks
-python generate.py
-cd ..
+cd src/codebooks && python generate.py
 ```
 
-Codebooks are saved to the directory specified by `SAVE_DIR` in `src/codebooks/config.py`. Training takes ~2h on A100 (MiniBatchKMeans) or ~13h (full KMeans). Train once, reuse across all experiments.
+Edit `src/codebooks/config.py` to target a different model. Training takes approximately 2 hours on A100 with MiniBatchKMeans.
 
-To change the target model, edit `src/codebooks/config.py`:
-```python
-MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-SAVE_DIR   = "codebooks_llama_8b"
-```
-
-### Step 1: W1 — Long-context language modeling (Table 4, Figure 4)
-
-PG-19 token-level NLL and perplexity with strided sliding-window protocol.
+### Step 1: W1 — Long context language modeling (PG-19)
 
 ```bash
 python scripts/experiment_runner.py \
-  --models meta-llama/Llama-3.1-8B-Instruct \
-  --codebook_dirs codebooks/codebooks_llama_8b \
-  --workloads w1 \
-  --context_lengths 8192 32768 \
+  --workloads w1 --context_lengths 8192 32768 131072 \
   --modes dense sphkv sphkv_recon sphkv_angle sphkv_rd \
-  --budgets 48 56 64 80 96 112 128 160 \
-  --n_warm 8 --n_meas 64 --n_trials 3 \
-  --device cuda
+  --budgets 48 56 64 80 96 112 128 160
 ```
 
-### Step 2: W2 — Retrieval QA (Table 5, Figure 5 A4)
-
-Multi-hop QA on HotpotQA and 2WikiMultiHopQA with distractor and position sweeps.
+### Step 2: W2 — Retrieval QA (HotpotQA / 2WikiMultiHopQA)
 
 ```bash
 python scripts/experiment_runner.py \
-  --models meta-llama/Llama-3.1-8B-Instruct \
-  --codebook_dirs codebooks/codebooks_llama_8b \
-  --workloads w2 \
-  --modes dense sphkv \
-  --budgets 60 \
-  --w2_task hotpotqa \
-  --w2_max_samples 50 \
-  --w2_distractors 0 3 5 \
-  --w2_positions early middle late \
-  --device cuda
+  --workloads w2 --modes dense sphkv --budgets 60 \
+  --w2_tasks hotpotqa 2wikimqa --w2_distractors 0 3 5
 ```
 
-Repeat with `--w2_task 2wikimqa` for the second dataset.
-
-### Step 3: W3 — Agentic rollouts (Table 6, Figure 5 A5)
-
-Multi-step tool-use trajectories measuring behavioral divergence.
+### Step 3: W3 — Agentic rollouts (ToolBench)
 
 ```bash
 python scripts/experiment_runner.py \
-  --models meta-llama/Llama-3.1-8B-Instruct \
-  --codebook_dirs codebooks/codebooks_llama_8b \
-  --workloads w3 \
-  --modes dense sphkv \
-  --budgets 60 \
-  --w3_source toolbench \
-  --w3_max_episodes 30 \
-  --w3_max_steps 10 \
-  --w3_seeds 3 \
-  --device cuda
+  --workloads w3 --modes dense sphkv --budgets 60 \
+  --w3_source toolbench --w3_max_episodes 30 --w3_seeds 3
 ```
 
-### Step 4: Ablations (Figure 5 A0-A3)
+### Ablations (Figure 5, A0 to A3)
 
 ```bash
 python scripts/experiment_runner.py \
-  --models meta-llama/Llama-3.1-8B-Instruct \
-  --codebook_dirs codebooks/codebooks_llama_8b \
-  --workloads w1 \
-  --context_lengths 8192 32768 \
-  --modes dense sphkv sphkv_recon sphkv_angle sphkv_rd \
-         keepdrop quant_only decoupled \
-  --budgets 48 64 80 112 160 \
-  --device cuda
+  --workloads w1 --context_lengths 8192 32768 \
+  --modes dense sphkv keepdrop quant_only decoupled sphkv_angle sphkv_rd \
+  --budgets 48 64 80 112 160
 ```
 
-### HBM traffic measurement (Table A.2)
-
-```bash
-ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum \
-    --nvtx --nvtx-include angle_logits \
-    --csv --log-file ncu_report.csv \
-    python scripts/experiment_runner.py --modes sphkv --budgets 60
-```
-
-## File Structure
-
-```
-├── README.md
-├── requirements.txt
-├── run.sh                                Convenience launcher for W1/W2/W3
-├── .gitignore
-│
-├── configs/
-│   └── config.py                         Pipeline config: tiers, budget, model name
-│
-├── scripts/
-│   └── experiment_runner.py              Full experiment harness for W1/W2/W3
-│
-├── docs/
-│   └── tier_allocation_dashboard.html    Pre-rendered interactive dashboard
-│
-└── src/
-    ├── _path_setup.py                    Adds src/ + configs/ to sys.path
-    │
-    ├── spherical_kv_pipeline.py          Main pipeline: ADA attention + RDR allocation
-    ├── decode_kernel.cu                  Fused CUDA decode kernel (per-position Q back-rotation)
-    ├── fused_decode.cpp                  C++ binding for the CUDA kernel
-    ├── fused_decode.py                   Python wrapper for the kernel
-    ├── sphkv_lut.py                      Per-layer page pool, kernel dispatch
-    │
-    ├── allocation.py                     Greedy knapsack tier allocator (Algorithm 1)
-    ├── distortion_proxy.py               Calibrated distortion proxy (Appendix C)
-    ├── calibrate_lambda.py               Offline calibration of tier lambdas
-    ├── calibrate_lambda_codebook.py      Codebook-aware lambda calibration
-    │
-    ├── tiers.py                          Tier dataclass and builder
-    ├── token_state.py                    Per-token state tracking
-    ├── paging.py                         Page layout and bitpacking
-    ├── pagebuilder.py                    Page construction from quantized codes
-    ├── pointer_table.py                  Page table for kernel dispatch
-    ├── bitpacking.py                     Bit-level packing utilities
-    │
-    ├── codebook_loader.py                Load trained codebooks from disk
-    ├── quantization.py                   Spherical quantization (radius + angular codes)
-    ├── spherical_parameterization.py     K -> (r, theta) decomposition per group
-    │
-    ├── llama_hooks.py                    Pre-RoPE K capture + patched decode forward
-    ├── resuse_proxy.py                   Token reuse proxy (EMA attention weights)
-    ├── stability_proxy.py                Logit stability proxy for drift detection
-    │
-    ├── evaluate.py                       Standalone evaluation with strided perplexity
-    ├── dataset_w2.py                     HotpotQA / 2WikiMultiHopQA loaders
-    ├── dataset_w3.py                     Agentic tool-use task loaders
-    ├── baselines.py                      Baseline KV-compression methods
-    ├── ablation_modes.py                 Ablation harness for paper figure 5
-    ├── negative_controls.py              Sanity-check baselines
-    ├── results.py                        Result aggregation and figures
-    ├── visualize.py                      Interactive tier allocation dashboard generator
-    ├── paper_plots.py                    Paper-quality plot rendering
-    ├── analysis.py                       Post-hoc analysis helpers
-    ├── hardware_audit.py                 GPU/CPU/memory environment table
-    ├── vllm_backend.py                   Optional vLLM backend
-    │
-    └── codebooks/                        Codebook training (run once per model)
-        ├── config.py                     Training config: K-means mode, samples, chunk size
-        ├── generate.py                   Codebook training (pre-RoPE K-means on C4)
-        ├── generate_importance.py        Variant: importance-weighted training
-        └── dataset_loader.py             C4 data loading for codebook training
-```
+---
 
 ## Configuration
-
-There are two config files serving different purposes.
 
 ### `configs/config.py` — Pipeline and experiment config
 
@@ -211,14 +192,6 @@ There are two config files serving different purposes.
 | `DEVICE` | `cuda` or `cpu` |
 | `TIERS` | List of (tier_id, name, group_size, b_theta, K_centroids) |
 
-Tier definitions follow the paper (Section 2.2):
-
-| Tier | Name | Group size (g) | b_theta | Centroids (K) |
-|------|------|----------------|---------|----------------|
-| 1 | High | 16 | 6 | 64 |
-| 2 | Mid | 16 | 4 | 16 |
-| 3 | Low | 32 | 3 | 8 |
-
 ### `src/codebooks/config.py` — Codebook training config
 
 | Parameter | Description |
@@ -226,40 +199,9 @@ Tier definitions follow the paper (Section 2.2):
 | `KMEANS_MODE` | `"full"` (best quality, slow) or `"minibatch"` (fast) |
 | `NUM_SAMPLES` | Number of C4 texts for training (default: 2000) |
 | `SEQ_LEN` | Max sequence length per sample (default: 512) |
-| `MAX_VECS_PER_GROUP` | Cap on training vectors per codebook (default: 100,000) |
 | `SAVE_DIR` | Output directory for trained `.pt` files |
 
-To train codebooks for a new model, edit `src/codebooks/config.py` and run:
-```bash
-cd src/codebooks
-python generate.py
-```
-
-## Expected Results
-
-Results to be filled after experiments on target hardware.
-
-### W1: Language Modeling (PG-19)
-
-| Model | Context | Dense PPL | SphKV PPL | PPL ratio | Speedup | KV Reduction |
-|-------|---------|-----------|-----------|-----------|---------|--------------|
-| | 8K | | | | | |
-| | 32K | | | | | |
-| | 128K | | | | | |
-
-### W2: Retrieval QA (HotpotQA)
-
-| Model | Distractors | Dense EM | SphKV EM | Dense F1 | SphKV F1 |
-|-------|-------------|----------|----------|----------|----------|
-| | 0 | | | | |
-| | 3 | | | | |
-| | 5 | | | | |
-
-### W3: Agentic Rollouts
-
-| Model | Dense success | SphKV success | Disagree rate |
-|-------|--------------|---------------|---------------|
-| | | | |
+---
 
 ## License
 
