@@ -46,11 +46,11 @@ Spherical KV is built from **two orthogonal ideas** plus a **serving contract**.
 
 ### 1. Angle-Domain Attention (no reconstruction)
 
-<p align="center">
+<!-- <p align="center">
   <img src="docs/angle_domain_attention.gif" width="680" alt="Interactive sphere showing angle-domain attention geometry">
   <br>
   <em>Keys are directions on the unit sphere. The decode kernel computes cos θ from angular codes, then scales by radius r. No dense k ∈ ℝᵈ is ever materialized.</em>
-</p>
+</p> -->
 
 Standard attention computes $\ell(\mathbf{q}, \mathbf{k}) = \mathbf{q}^\top \mathbf{k} / \sqrt{d}$. Writing $\mathbf{q} = \|\mathbf{q}\|\hat{\mathbf{q}}$ and $\mathbf{k} = \|\mathbf{k}\|\hat{\mathbf{k}}$ where $\hat{\mathbf{q}}, \hat{\mathbf{k}} \in \mathbb{S}^{d-1}$, the logit decomposes exactly:
 
